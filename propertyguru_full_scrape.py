@@ -1398,8 +1398,9 @@ if __name__ == "__main__":
         df["scrape_date"] = scrape_dt_local.dt.strftime("%Y-%m-%d %H:%M:%S")
         cols = ["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]
         for c in cols:
-            if c not in df.columns: df[c] = None
-        df_final = df[cols]
+            if c not in df.columns:
+                df[c] = ""
+        df_final = df[cols].fillna("")
         df_final.to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
         total_rows = len(df_final)
     else:
@@ -1498,8 +1499,9 @@ if __name__ == "__main__":
             "updated_date","listed_time","scrape_date","agent_id"
         ]
         for c in final_cols:
-            if c not in df_merged.columns: df_merged[c] = None
-        df_final = df_merged[final_cols]
+            if c not in df_merged.columns:
+                df_merged[c] = ""
+        df_final = df_merged[final_cols].fillna("")
         df_final.to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
         total_rows_view = len(df_final)
     else:

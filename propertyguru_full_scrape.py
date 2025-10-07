@@ -1393,12 +1393,10 @@ if __name__ == "__main__":
             df = df.drop_duplicates(subset=["url","intent","segment"])
         listed_dt_local = pd.to_datetime(df.get("listed_unix"), unit="s", utc=True, errors="coerce") + pd.Timedelta(hours=8)
         scrape_dt_local = pd.to_datetime(df.get("scrape_unix"), unit="s", utc=True, errors="coerce") + pd.Timedelta(hours=8)
-        df["updated_date"] = listed_dt_local.dt.strftime("%Y-%m-%d")
-        df["listed_time"] = listed_dt_local.dt.strftime("%H:%M:%S")
+        df["updated_date"]     = listed_dt_local.dt.strftime("%Y-%m-%d")
+        df["listed_time"]     = listed_dt_local.dt.strftime("%H:%M:%S")
         df["scrape_date"] = scrape_dt_local.dt.strftime("%Y-%m-%d %H:%M:%S")
-        cols = [
-            "intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"
-        ]
+        cols = ["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]
         for c in cols:
             if c not in df.columns:
                 df[c] = ""
@@ -1406,9 +1404,7 @@ if __name__ == "__main__":
         df_final.to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
         total_rows = len(df_final)
     else:
-        pd.DataFrame(
-            columns=["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]
-        ).to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]).to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
     print(f"📄 ADLIST CSV written: {adlist_csv_path} (rows: {total_rows})")
     compress_and_upload(adlist_csv_path, csv_bot, label="ADLIST")
     
@@ -1485,29 +1481,22 @@ if __name__ == "__main__":
         df_view = pd.DataFrame(adview.adview_rows).drop_duplicates(subset=["url"])
 
         # Adlist slice for merge
-        df_adlist = pd.read_csv(adlist_csv_path)
-        needed_cols = ["url","updated_date","listed_time","scrape_date","agent_id","ad_id","intent","segment"]
-        for col in needed_cols:
-            if col not in df_adlist.columns:
-                df_adlist[col] = ""
-        df_adlist = df_adlist[needed_cols]
+        df_adlist = pd.read_csv(adlist_csv_path)[["url","updated_date","listed_time","scrape_date","agent_id","ad_id"]]
 
         # Merge on URL, prefer ADVIEW ad_id if present, else fill from ADLIST
         df_merged = df_view.merge(df_adlist, on="url", how="left", suffixes=("", "_adlist"))
         df_merged["ad_id"] = df_merged["ad_id"].fillna(df_merged.get("ad_id_adlist"))
         if "ad_id_adlist" in df_merged.columns: df_merged.drop(columns=["ad_id_adlist"], inplace=True)
 
-        df_merged["id"] = df_merged.get("agent_id", "")
-        df_merged["market"] = df_merged.get("segment", "")
-        df_merged["rent_sale"] = df_merged.get("intent", "")
-        df_merged["posted_time"] = df_merged.get("listed_time", "")
-
         # To MYT for scrape_unix if you ever want; but final timing comes from ADLIST
         final_cols = [
-            "activate_date","id","ad_id","listing_id","agency","build_up","land_area","car_park","currency","email",
-            "furnishing","lister","seller_name","market","phone_number","phone","phone_number2","posted_date",
-            "posted_time","created_time","price","property_type","region","ren","rent_sale","rooms","scrape_date",
-            "source","state","subregion","title","location","toilets","type","updated_date","url"
+            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
+            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
+            "tenure","property_title","bumi_lot","total_units","completion_year","developer",
+            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
+            "amenities","facilities",
+            # from ADLIST:
+            "updated_date","listed_time","scrape_date","agent_id"
         ]
         for c in final_cols:
             if c not in df_merged.columns:
@@ -1517,10 +1506,11 @@ if __name__ == "__main__":
         total_rows_view = len(df_final)
     else:
         pd.DataFrame(columns=[
-            "activate_date","id","ad_id","listing_id","agency","build_up","land_area","car_park","currency","email",
-            "furnishing","lister","seller_name","market","phone_number","phone","phone_number2","posted_date",
-            "posted_time","created_time","price","property_type","region","ren","rent_sale","rooms","scrape_date",
-            "source","state","subregion","title","location","toilets","type","updated_date","url"
+            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
+            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
+            "tenure","property_title","bumi_lot","total_units","completion_year","developer",
+            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
+            "amenities","facilities","updated_date","listed_time","scrape_date","agent_id"
         ]).to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
 
     print(f"📄 ADVIEW CSV written: {adview_csv_path} (rows: {total_rows_view})")

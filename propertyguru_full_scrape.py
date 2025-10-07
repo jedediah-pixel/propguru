@@ -525,11 +525,11 @@ def extract_adlist_rows_from_nextdata(text:str, intent:str, segment:str, page_no
         agent = ld.get("agent") or {}
         agent_name = agent.get("name") if isinstance(agent, dict) else None
         agent_id   = agent.get("id")   if isinstance(agent, dict) else None
-        listing_id = ld.get("id") or ld.get("listingId") or item.get("id") or None
+        ad_id = ld.get("id") or ld.get("listingId") or item.get("id") or None
         rows.append({
             "intent": intent, "segment": segment, "url": url, "title": title,
             "listed_unix": listed_unix, "agent_name": agent_name, "agent_id": agent_id,
-            "listing_id": listing_id, "page_no": page_no
+            "ad_id": ad_id, "page_no": page_no
         })
     return rows
 
@@ -709,7 +709,7 @@ def fill_from_details(strings, seed):
         if not seed["bumi_lot"] and (m:=R_BUMI.search(v)): seed["bumi_lot"] = "Not Bumi Lot" if "Not" in m.group(0) else "Bumi Lot"
         if not seed["developer"] and (m:=R_DEV.search(v)): seed["developer"] = m.group(1).strip()
         if not seed["completion_year"] and (m:=R_COMPLETE_YR.search(v)): seed["completion_year"] = m.group(2)
-        if not seed["floor_area"] and (m:=R_FLOOR.search(v)): seed["floor_area"] = digits_only(m.group(1))
+        if not seed["build_up"] and (m:=R_FLOOR.search(v)): seed["build_up"] = digits_only(m.group(1))
         if not seed["land_area"] and (m:=R_LAND.search(v)): seed["land_area"] = digits_only(m.group(1))
         if not seed["price_per_square_feet"] and (m:=R_PSF.search(v)): seed["price_per_square_feet"] = digits_only(m.group(1))
         if not seed["tenure"] and (m:=R_TENURE_TXT.search(v)): seed["tenure"] = m.group(1).title()
@@ -1110,7 +1110,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
             url      = task["url"]
             intent   = task.get("intent","unknown")
             segment  = task.get("segment","unknown")
-            l_id_in  = task.get("listing_id")
+            ad_id_in = task.get("ad_id")
             attempt  = task.get("attempt", 1)
             in_final = task.get("phase") == "Final"
 
@@ -1133,8 +1133,8 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 except Exception:
                     data = {}
                 dd = get_data_root(data)
-                listing_id = (dd.get("listingData") or {}).get("id") or (dd.get("listingData") or {}).get("listingId") or l_id_in
-                raw_name = f"adview_{safe_name(intent)}_{safe_name(segment)}_{safe_name(listing_id or url)}.json"
+                ad_id = (dd.get("listingData") or {}).get("id") or (dd.get("listingData") or {}).get("listingId") or ad_id_in
+                raw_name = f"adview_{safe_name(intent)}_{safe_name(segment)}_{safe_name(ad_id or url)}.json"
                 with open(os.path.join(ADVIEW_DIR, raw_name), "w", encoding="utf-8") as f:
                     f.write(text)
 
@@ -1143,7 +1143,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 property_info = (dd.get("propertyOverviewData", {}) or {}).get("propertyInfo", {}) or {}
                 row = {}
                 row["url"]   = make_abs(pick_first(dd, URL_PATHS)) or url
-                row["listing_id"] = listing_id
+                row["ad_id"] = ad_id
                 row["title"] = (pick_first(dd, TITLE_PATHS) or (ld.get("property") or {}).get("typeText") or "")
 
                 address = pick_first(dd, ADDRESS_PATHS)
@@ -1155,7 +1155,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
 
                 row["property_type"] = pick_first(dd, PROPERTY_TYPE_PATHS) or ""
                 row["address"] = address or ""
-                row["state"], row["district"], row["subarea"] = state or "", district or "", subarea or ""
+                row["state"], row["subregion"], row["subarea"] = state or "", district or "", subarea or ""
 
                 # Location (robust, combined)
                 if address and state and district:
@@ -1165,12 +1165,12 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                     row["location"] = ", ".join(parts) if parts else address or ""
 
                 # Lister & agency
-                row["lister_name"] = pick_first(dd, LISTER_NAME_PATHS) or ""
+                row["lister"] = pick_first(dd, LISTER_NAME_PATHS) or ""
                 row["lister_url"]  = make_abs(pick_first(dd, LISTER_URL_PATHS)) or ""
                 row["phone_number"]= str(pick_first(dd, PHONE_PATHS) or "")
                 row["agency"]      = pick_first(dd, AGENCY_NAME_PATHS) or ""
                 row["agency_registration_number"] = pick_first(dd, AGENCY_REG_PATHS) or ""
-                row["ren_number"]  = str(pick_first(dd, REN_PATHS) or "")
+                row["ren"]  = str(pick_first(dd, REN_PATHS) or "")
 
                 # Price & core numbers
                 # Prefer numeric fields first; only parse pretty as a fallback
@@ -1188,7 +1188,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 row["price_per_square_feet"] = digits_only(psf_raw) if psf_raw != "" else ""
 
                 row["furnishing"], furn_src = extract_furnishing(dd)
-                row["floor_area"] = digits_only(pick_first(dd, FLOOR_AREA_PATHS))
+                row["build_up"] = digits_only(pick_first(dd, FLOOR_AREA_PATHS))
                 row["land_area"]  = digits_only(pick_first(dd, LAND_AREA_PATHS))
                 row["tenure"] = map_tenure(pick_first(dd, TENURE_PATHS))
                 row["property_title"] = pick_first(dd, PROPERTY_TITLE_PATHS) or ""
@@ -1201,7 +1201,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 seed = {
                     "property_title": row["property_title"], "bumi_lot": row["bumi_lot"],
                     "developer": row["developer"], "completion_year": digits_only(row["completion_year"]),
-                    "floor_area": row["floor_area"], "land_area": row["land_area"],
+                    "build_up": row["build_up"], "land_area": row["land_area"],
                     "price_per_square_feet": row["price_per_square_feet"], "tenure": row["tenure"],
                     "furnishing": row.get("furnishing", "")
                 }
@@ -1211,7 +1211,7 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 row["bumi_lot"] = seed["bumi_lot"] or row["bumi_lot"]
                 row["developer"] = seed["developer"] or row["developer"]
                 row["completion_year"] = seed["completion_year"] or digits_only(row["completion_year"])
-                row["floor_area"] = seed["floor_area"] or row["floor_area"]
+                row["build_up"] = seed["build_up"] or row["build_up"]
                 row["land_area"]  = seed["land_area"] or row["land_area"]
                 row["price_per_square_feet"] = seed["price_per_square_feet"] or row["price_per_square_feet"]
                 row["tenure"] = seed["tenure"] or row["tenure"]
@@ -1393,17 +1393,17 @@ if __name__ == "__main__":
             df = df.drop_duplicates(subset=["url","intent","segment"])
         listed_dt_local = pd.to_datetime(df.get("listed_unix"), unit="s", utc=True, errors="coerce") + pd.Timedelta(hours=8)
         scrape_dt_local = pd.to_datetime(df.get("scrape_unix"), unit="s", utc=True, errors="coerce") + pd.Timedelta(hours=8)
-        df["listed_date"]     = listed_dt_local.dt.strftime("%Y-%m-%d")
+        df["updated_date"]     = listed_dt_local.dt.strftime("%Y-%m-%d")
         df["listed_time"]     = listed_dt_local.dt.strftime("%H:%M:%S")
-        df["scrape_datetime"] = scrape_dt_local.dt.strftime("%Y-%m-%d %H:%M:%S")
-        cols = ["intent","segment","url","title","listed_date","listed_time","scrape_datetime","agent_name","agent_id","listing_id"]
+        df["scrape_date"] = scrape_dt_local.dt.strftime("%Y-%m-%d %H:%M:%S")
+        cols = ["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]
         for c in cols:
             if c not in df.columns: df[c] = None
         df_final = df[cols]
         df_final.to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
         total_rows = len(df_final)
     else:
-        pd.DataFrame(columns=["intent","segment","url","title","listed_date","listed_time","scrape_datetime","agent_name","agent_id","listing_id"]).to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=["intent","segment","url","title","updated_date","listed_time","scrape_date","agent_name","agent_id","ad_id"]).to_csv(adlist_csv_path, index=False, encoding="utf-8-sig")
     print(f"📄 ADLIST CSV written: {adlist_csv_path} (rows: {total_rows})")
     compress_and_upload(adlist_csv_path, csv_bot, label="ADLIST")
     
@@ -1432,7 +1432,7 @@ if __name__ == "__main__":
             "url": url,
             "intent": row.get("intent","unknown"),
             "segment": row.get("segment","unknown"),
-            "listing_id": row.get("listing_id") if "listing_id" in row else None,
+            "ad_id": row.get("ad_id") if "ad_id" in row else None,
             "attempt": 1
         }
         adview.ready_q.put(task); adview_urls += 1
@@ -1480,22 +1480,22 @@ if __name__ == "__main__":
         df_view = pd.DataFrame(adview.adview_rows).drop_duplicates(subset=["url"])
 
         # Adlist slice for merge
-        df_adlist = pd.read_csv(adlist_csv_path)[["url","listed_date","listed_time","scrape_datetime","agent_id","listing_id"]]
+        df_adlist = pd.read_csv(adlist_csv_path)[["url","updated_date","listed_time","scrape_date","agent_id","ad_id"]]
 
-        # Merge on URL, prefer ADVIEW listing_id if present, else fill from ADLIST
+        # Merge on URL, prefer ADVIEW ad_id if present, else fill from ADLIST
         df_merged = df_view.merge(df_adlist, on="url", how="left", suffixes=("", "_adlist"))
-        df_merged["listing_id"] = df_merged["listing_id"].fillna(df_merged.get("listing_id_adlist"))
-        if "listing_id_adlist" in df_merged.columns: df_merged.drop(columns=["listing_id_adlist"], inplace=True)
+        df_merged["ad_id"] = df_merged["ad_id"].fillna(df_merged.get("ad_id_adlist"))
+        if "ad_id_adlist" in df_merged.columns: df_merged.drop(columns=["ad_id_adlist"], inplace=True)
 
         # To MYT for scrape_unix if you ever want; but final timing comes from ADLIST
         final_cols = [
-            "url","listing_id","title","property_type","state","district","subarea","location","address",
-            "price","price_per_square_feet","rooms","toilets","furnishing","floor_area","land_area",
+            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
+            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
             "tenure","property_title","bumi_lot","total_units","completion_year","developer",
-            "lister_name","lister_url","phone_number","agency","agency_registration_number","ren_number",
+            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
             "amenities","facilities",
             # from ADLIST:
-            "listed_date","listed_time","scrape_datetime","agent_id"
+            "updated_date","listed_time","scrape_date","agent_id"
         ]
         for c in final_cols:
             if c not in df_merged.columns: df_merged[c] = None
@@ -1504,11 +1504,11 @@ if __name__ == "__main__":
         total_rows_view = len(df_final)
     else:
         pd.DataFrame(columns=[
-            "url","listing_id","title","property_type","state","district","subarea","location","address",
-            "price","price_per_square_feet","rooms","toilets","furnishing","floor_area","land_area",
+            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
+            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
             "tenure","property_title","bumi_lot","total_units","completion_year","developer",
-            "lister_name","lister_url","phone_number","agency","agency_registration_number","ren_number",
-            "amenities","facilities","listed_date","listed_time","scrape_datetime","agent_id"
+            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
+            "amenities","facilities","updated_date","listed_time","scrape_date","agent_id"
         ]).to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
 
     print(f"📄 ADVIEW CSV written: {adview_csv_path} (rows: {total_rows_view})")

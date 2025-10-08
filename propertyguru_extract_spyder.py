@@ -2,7 +2,8 @@
 """
 PropertyGuru extractor — Spyder-friendly
 - If ROOT is blank or not found, prompts you to select a folder (GUI if available; else console input).
-- Traverses a ROOT directory (plain .html, .htm, .zip containing html, and gzipped html)
+- Traverses a ROOT directory looking for PropertyGuru ADVIEW payloads (raw Next.js
+  JSON from the full scraper, plain .html/.htm, zipped, or gzipped variants)
 - Extracts listing fields using the same structural rules as the production scraper
 - Writes a CSV named 'propertyguru_extract.csv' inside the selected ROOT
 
@@ -493,68 +494,105 @@ DEVELOPER_PATHS = [
 
 
 # ------------------- FILE ITERATOR -------------------
-def iter_html_payloads(root):
+def _detect_payload_type(text, explicit=None):
+    if explicit:
+        return explicit
+    sample = text.lstrip()
+    if sample.startswith("{") or sample.startswith("["):
+        return "json"
+    return "html"
+
+
+def iter_payloads(root):
     for dirpath, dirnames, filenames in os.walk(root):
-        for d in list(dirnames):
-            if d.lower().endswith(".html"):
-                sub = os.path.join(dirpath, d)
-                for ddp, _, fns in os.walk(sub):
-                    for fn in fns:
-                        if fn.lower().endswith(".html"):
-                            p = os.path.join(ddp, fn)
-                            try:
-                                with open(p, "rb") as fh:
-                                    yield p, fh.read().decode("utf-8", "ignore")
-                            except Exception:
-                                pass
         for fn in filenames:
             path = os.path.join(dirpath, fn)
-            try:
-                with open(path, "rb") as fh:
-                    head = fh.read(4)
-                    fh.seek(0)
-                    blob = fh.read()
-            except Exception:
-                continue
-            if head.startswith(b"PK\x03\x04"):
+            lower = fn.lower()
+
+            if lower.endswith(".json"):
                 try:
-                    with zipfile.ZipFile(path) as z:
-                        for n in z.namelist():
-                            if n.lower().endswith(".html"):
-                                try:
-                                    yield f"{path}|{n}", z.read(n).decode("utf-8", "ignore")
-                                except Exception:
-                                    continue
-                except Exception:
-                    pass
-                continue
-            if len(blob) >= 2 and blob[:2] == b"\x1f\x8b":
-                try:
-                    html = gzip.decompress(blob).decode("utf-8", "ignore")
-                    yield path, html
+                    with open(path, "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                    yield path, text, "json"
                 except Exception:
                     continue
                 continue
-            if fn.lower().endswith((".html", ".htm")):
+
+            if lower.endswith((".json.gz", ".gz")):
                 try:
-                    yield path, blob.decode("utf-8", "ignore")
+                    with open(path, "rb") as fh:
+                        blob = fh.read()
+                    text = gzip.decompress(blob).decode("utf-8", "ignore")
+                    yield path, text, _detect_payload_type(text, "json" if lower.endswith(".json.gz") else None)
+                except Exception:
+                    continue
+                continue
+
+            if lower.endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(path) as z:
+                        for n in z.namelist():
+                            n_lower = n.lower()
+                            try:
+                                text = z.read(n).decode("utf-8", "ignore")
+                            except Exception:
+                                continue
+                            explicit = None
+                            if n_lower.endswith(".json"):
+                                explicit = "json"
+                            elif n_lower.endswith((".html", ".htm")):
+                                explicit = "html"
+                            yield f"{path}|{n}", text, _detect_payload_type(text, explicit)
+                except Exception:
+                    continue
+                continue
+
+            if lower.endswith((".html", ".htm")):
+                try:
+                    with open(path, "rb") as fh:
+                        html = fh.read().decode("utf-8", "ignore")
+                    yield path, html, "html"
                 except Exception:
                     continue
 
 
 # ------------------- MAIN EXTRACTION -------------------
-def extract_row(name, html):
-    soup = BeautifulSoup(html, "html.parser")
-    data = find_data_root(soup)
-    if not data:
-        print(f"[WARN] {name}: Next.js data not found")
-        return None
+def extract_row(name, payload, payload_type):
+    soup = None
+    data = {}
+
+    if payload_type == "json":
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            print(f"[WARN] {name}: JSON decode failed")
+            return None
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    data = get_data_root(item)
+                    if data:
+                        break
+        else:
+            data = get_data_root(obj)
+        if not data and isinstance(obj, dict):
+            if "listingData" in obj and "propertyOverviewData" in obj:
+                data = obj
+        if not data:
+            print(f"[WARN] {name}: listing data not found in JSON")
+            return None
+    else:
+        soup = BeautifulSoup(payload, "html.parser")
+        data = find_data_root(soup)
+        if not data:
+            print(f"[WARN] {name}: Next.js data not found")
+            return None
 
     listing = data.get("listingData", {}) or {}
     property_info = ((data.get("propertyOverviewData") or {}).get("propertyInfo") or {})
 
     url = make_abs(pick_first(data, URL_PATHS)) or ""
-    if not url:
+    if not url and soup is not None:
         link = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
         if link and link.get("href"):
             url = link["href"].strip()
@@ -646,10 +684,10 @@ def run():
     processed = 0
     print(f"Scanning: {root}")
 
-    for name, html in iter_html_payloads(root):
+    for name, payload, payload_type in iter_payloads(root):
         seen += 1
         try:
-            row = extract_row(name, html)
+            row = extract_row(name, payload, payload_type)
         except Exception as exc:
             print(f"[WARN] {name}: {exc}")
             row = None

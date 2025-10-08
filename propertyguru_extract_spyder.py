@@ -311,6 +311,80 @@ def extract_posted_date_time(data):
     return "", ""
 
 
+def _normalize_rent_sale_value(value):
+    if value in (None, ""):
+        return ""
+
+    s = str(value).strip().lower()
+    if not s:
+        return ""
+
+    if re.search(r"\bsale\b", s):
+        return "sale"
+    if re.search(r"\brent\b", s) or re.search(r"\brental\b", s):
+        return "rent"
+
+    return ""
+
+
+def extract_rent_sale(data):
+    primary_val = _normalize_rent_sale_value(get_by_path(data, "listingData.listingType"))
+    if primary_val:
+        return primary_val
+
+    for path in (
+        "listingData.listingTypeText",
+        "listingData.listingTypeLocalizedText",
+    ):
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    url_val = get_by_path(data, "listingData.url")
+    url_norm = _normalize_rent_sale_value(url_val)
+    if url_norm:
+        return url_norm
+
+    breadcrumbs = get_by_path(data, "breadcrumbsData.items")
+    if isinstance(breadcrumbs, list):
+        for item in reversed(breadcrumbs):
+            if not isinstance(item, dict):
+                continue
+            val = _normalize_rent_sale_value(item.get("text"))
+            if val:
+                return val
+
+    backup_val = _normalize_rent_sale_value(get_by_path(data, "similarListingsData.listingType"))
+    if backup_val:
+        return backup_val
+
+    for path in RENT_SALE_PATHS:
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    return ""
+
+
+def extract_car_park(data):
+    meta_items = get_by_path(data, "detailsData.metatable.items")
+    if isinstance(meta_items, list):
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("value")
+            if not value:
+                continue
+            value_str = str(value)
+            if re.search(r"parking|car\s*park", value_str, re.I):
+                digits = digits_only(value_str)
+                if digits:
+                    return digits
+
+    fallback_val = pick_first(data, CAR_PARK_PATHS)
+    return digits_only(fallback_val)
+
+
 # Regexes used when filling details
 R_BUMI = re.compile(r"\b(?:Not\s+)?Bumi\s+Lot\b", re.I)
 R_TITLE = re.compile(r"\b(Individual|Strata|Master)\s+title\b", re.I)
@@ -610,14 +684,14 @@ CURRENCY_PATHS = [
     "listingData.currency",
 ]
 ROOMS_PATHS = [
-    "propertyOverviewData.propertyInfo.bedrooms",
-    "listingData.property.bedrooms",
     "listingData.bedrooms",
+    "listingData.property.bedrooms",
+    "propertyOverviewData.propertyInfo.bedrooms",
 ]
 TOILETS_PATHS = [
-    "propertyOverviewData.propertyInfo.bathrooms",
-    "listingData.property.bathrooms",
     "listingData.bathrooms",
+    "listingData.property.bathrooms",
+    "propertyOverviewData.propertyInfo.bathrooms",
 ]
 PSF_PATHS = [
     "propertyOverviewData.propertyInfo.price.perSqft",
@@ -810,7 +884,7 @@ def extract_row(name, payload, payload_type):
     updated_date_val = str(pick_first(data, UPDATED_DATE_PATHS) or listing.get("updatedAt") or listing.get("updatedDate") or listing.get("updateTime") or "")
     activate_date_val = str(pick_first(data, ACTIVATE_DATE_PATHS) or listing.get("activateDate") or listing.get("activationDate") or "")
 
-    car_park_val = str(pick_first(data, CAR_PARK_PATHS) or "")
+    car_park_val = extract_car_park(data)
     currency_val = "RM"
     email_val = str(pick_first(data, EMAIL_PATHS) or "")
     seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
@@ -818,7 +892,7 @@ def extract_row(name, payload, payload_type):
     phone_primary = str(pick_first(data, PHONE_PATHS) or "")
     phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
     region_val = str(pick_first(data, REGION_PATHS) or "")
-    rent_sale_val = ""
+    rent_sale_val = extract_rent_sale(data)
     type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
 
     scrape_unix = int(time.time())

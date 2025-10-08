@@ -688,22 +688,22 @@ def extract_row(name, payload, payload_type):
     activate_date_val = str(pick_first(data, ACTIVATE_DATE_PATHS) or listing.get("activateDate") or listing.get("activationDate") or "")
 
     car_park_val = str(pick_first(data, CAR_PARK_PATHS) or "")
-    currency_val = str(pick_first(data, CURRENCY_PATHS) or "")
+    currency_val = "RM"
     email_val = str(pick_first(data, EMAIL_PATHS) or "")
     seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
     market_val = str(pick_first(data, MARKET_PATHS) or "")
     phone_primary = str(pick_first(data, PHONE_PATHS) or "")
     phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
     region_val = str(pick_first(data, REGION_PATHS) or "")
-    rent_sale_val = str(pick_first(data, RENT_SALE_PATHS) or listing.get("listingType") or listing.get("purpose") or listing.get("transactionType") or "")
+    rent_sale_val = ""
     type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
 
     scrape_unix = int(time.time())
-    scrape_date_val = time.strftime("%Y-%m-%d", time.localtime(scrape_unix))
+    scrape_date_val = ""
 
     row = {
         "activate_date": activate_date_val,
-        "id": listing_uuid,
+        "id": f"pg_{ad_identifier}" if ad_identifier else "",
         "ad_id": ad_identifier,
         "listing_id": listing_id,
         "agency": pick_first(data, AGENCY_NAME_PATHS) or "",
@@ -729,7 +729,7 @@ def extract_row(name, payload, payload_type):
         "rent_sale": rent_sale_val,
         "rooms": str(pick_first(data, ROOMS_PATHS) or ""),
         "scrape_date": scrape_date_val,
-        "source": "PropertyGuru",
+        "source": "propertyguru.com.my",
         "state": state or "",
         "subregion": district or "",
         "title": title or "",

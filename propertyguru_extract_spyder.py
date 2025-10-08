@@ -411,6 +411,12 @@ PHONE_PATHS = [
     "listingData.agent.mobile",
     "listingData.agent.contactNumber",
 ]
+PHONE2_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.phone",
+    "listingData.agent.contactNumbers.1.number",
+    "listingData.agent.contactNumbers.1.displayNumber",
+    "listingData.agent.secondaryPhone",
+]
 AGENCY_NAME_PATHS = [
     "contactAgentData.contactAgentCard.agency.name",
     "listingData.agent.agency.name",
@@ -435,6 +441,63 @@ PRICE_PATHS = [
     "listingData.priceValue",
     "listingData.pricePretty",
     "listingData.price",
+]
+CAR_PARK_PATHS = [
+    "propertyOverviewData.propertyInfo.carPark",
+    "listingData.property.carPark",
+    "listingData.carPark",
+    "listingData.carParks",
+]
+EMAIL_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.email",
+    "listingData.agent.email",
+]
+SELLER_NAME_PATHS = [
+    "listingData.sellerName",
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.sellerName",
+]
+MARKET_PATHS = [
+    "listingData.market",
+    "propertyOverviewData.propertyInfo.market",
+]
+REGION_PATHS = [
+    "listingData.regionName",
+    "propertyOverviewData.propertyInfo.regionName",
+]
+RENT_SALE_PATHS = [
+    "listingData.listingType",
+    "listingData.purpose",
+    "listingData.transactionType",
+]
+TYPE_PATHS = [
+    "listingData.type",
+    "listingData.property.listingType",
+]
+POSTED_DATE_PATHS = [
+    "listingData.publishedDate",
+    "listingData.postedDate",
+]
+POSTED_TIME_PATHS = [
+    "listingData.publishedTime",
+    "listingData.postedTime",
+]
+CREATED_TIME_PATHS = [
+    "listingData.createdAt",
+    "listingData.createdDate",
+    "listingData.createTime",
+]
+UPDATED_DATE_PATHS = [
+    "listingData.updatedAt",
+    "listingData.updatedDate",
+    "listingData.updateTime",
+]
+ACTIVATE_DATE_PATHS = [
+    "listingData.activateDate",
+    "listingData.activationDate",
+]
+CURRENCY_PATHS = [
+    "propertyOverviewData.propertyInfo.price.currency",
+    "listingData.currency",
 ]
 ROOMS_PATHS = [
     "propertyOverviewData.propertyInfo.bedrooms",
@@ -597,7 +660,6 @@ def extract_row(name, payload, payload_type):
         if link and link.get("href"):
             url = link["href"].strip()
 
-    ad_id = listing.get("id") or listing.get("listingId")
     title = pick_first(data, TITLE_PATHS) or (listing.get("property") or {}).get("typeText") or ""
 
     address = pick_first(data, ADDRESS_PATHS)
@@ -615,31 +677,77 @@ def extract_row(name, payload, payload_type):
 
     furnishing, furnishing_source = extract_furnishing(data)
 
+    listing_uuid = str(listing.get("id") or "")
+    listing_id = str(listing.get("listingId") or "")
+    ad_identifier = str(listing.get("adId") or listing_uuid or listing_id or "")
+
+    posted_date_val = str(pick_first(data, POSTED_DATE_PATHS) or listing.get("publishedDate") or listing.get("postedDate") or "")
+    posted_time_val = str(pick_first(data, POSTED_TIME_PATHS) or listing.get("publishedTime") or listing.get("postedTime") or "")
+    created_time_val = str(pick_first(data, CREATED_TIME_PATHS) or listing.get("createdAt") or listing.get("createdDate") or listing.get("createTime") or "")
+    updated_date_val = str(pick_first(data, UPDATED_DATE_PATHS) or listing.get("updatedAt") or listing.get("updatedDate") or listing.get("updateTime") or "")
+    activate_date_val = str(pick_first(data, ACTIVATE_DATE_PATHS) or listing.get("activateDate") or listing.get("activationDate") or "")
+
+    car_park_val = str(pick_first(data, CAR_PARK_PATHS) or "")
+    currency_val = str(pick_first(data, CURRENCY_PATHS) or "")
+    email_val = str(pick_first(data, EMAIL_PATHS) or "")
+    seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
+    market_val = str(pick_first(data, MARKET_PATHS) or "")
+    phone_primary = str(pick_first(data, PHONE_PATHS) or "")
+    phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
+    region_val = str(pick_first(data, REGION_PATHS) or "")
+    rent_sale_val = str(pick_first(data, RENT_SALE_PATHS) or listing.get("listingType") or listing.get("purpose") or listing.get("transactionType") or "")
+    type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
+
+    scrape_unix = int(time.time())
+    scrape_date_val = time.strftime("%Y-%m-%d", time.localtime(scrape_unix))
+
     row = {
-        "file": name,
-        "url": url or "",
-        "ad_id": str(ad_id or ""),
-        "title": title or "",
-        "property_type": pick_first(data, PROPERTY_TYPE_PATHS) or "",
-        "address": address or "",
-        "state": state or "",
-        "subregion": district or "",
-        "subarea": subarea or "",
-        "location": location or "",
-        "lister": pick_first(data, LISTER_NAME_PATHS) or "",
-        "lister_url": make_abs(pick_first(data, LISTER_URL_PATHS)) or "",
-        "phone_number": str(pick_first(data, PHONE_PATHS) or ""),
+        "activate_date": activate_date_val,
+        "id": listing_uuid,
+        "ad_id": ad_identifier,
+        "listing_id": listing_id,
         "agency": pick_first(data, AGENCY_NAME_PATHS) or "",
-        "agency_registration_number": pick_first(data, AGENCY_REG_PATHS) or "",
-        "ren": str(pick_first(data, REN_PATHS) or ""),
-        "price": parse_money_value(pick_first(data, PRICE_PATHS)),
-        "rooms": str(pick_first(data, ROOMS_PATHS) or ""),
-        "toilets": str(pick_first(data, TOILETS_PATHS) or ""),
-        "price_per_square_feet": digits_only(pick_first(data, PSF_PATHS)),
-        "furnishing": furnishing,
-        "furnishing_source": furnishing_source,
         "build_up": digits_only(pick_first(data, FLOOR_AREA_PATHS)),
         "land_area": digits_only(pick_first(data, LAND_AREA_PATHS)),
+        "car_park": car_park_val,
+        "currency": currency_val,
+        "email": email_val,
+        "furnishing": furnishing,
+        "lister": pick_first(data, LISTER_NAME_PATHS) or "",
+        "seller_name": seller_name_val,
+        "market": market_val,
+        "phone_number": phone_primary,
+        "phone": phone_primary or phone_secondary,
+        "phone_number2": phone_secondary,
+        "posted_date": posted_date_val,
+        "posted_time": posted_time_val,
+        "created_time": created_time_val,
+        "price": parse_money_value(pick_first(data, PRICE_PATHS)),
+        "property_type": pick_first(data, PROPERTY_TYPE_PATHS) or "",
+        "region": region_val,
+        "ren": str(pick_first(data, REN_PATHS) or ""),
+        "rent_sale": rent_sale_val,
+        "rooms": str(pick_first(data, ROOMS_PATHS) or ""),
+        "scrape_date": scrape_date_val,
+        "source": "PropertyGuru",
+        "state": state or "",
+        "subregion": district or "",
+        "title": title or "",
+        "location": location or "",
+        "toilets": str(pick_first(data, TOILETS_PATHS) or ""),
+        "type": type_val,
+        "updated_date": updated_date_val,
+        "url": url or "",
+    }
+
+    row.update({
+        "file": name,
+        "address": address or "",
+        "subarea": subarea or "",
+        "lister_url": make_abs(pick_first(data, LISTER_URL_PATHS)) or "",
+        "agency_registration_number": pick_first(data, AGENCY_REG_PATHS) or "",
+        "price_per_square_feet": digits_only(pick_first(data, PSF_PATHS)),
+        "furnishing_source": furnishing_source,
         "tenure": map_tenure(pick_first(data, TENURE_PATHS)),
         "property_title": pick_first(data, PROPERTY_TITLE_PATHS) or "",
         "bumi_lot": pick_first(data, BUMI_PATHS) or "",
@@ -648,8 +756,8 @@ def extract_row(name, payload, payload_type):
         "developer": pick_first(data, DEVELOPER_PATHS) or "",
         "amenities": build_amenities(property_info),
         "facilities": build_facilities(data),
-        "scrape_unix": int(time.time()),
-    }
+        "scrape_unix": scrape_unix,
+    })
 
     seed = {
         "property_title": row["property_title"],
@@ -696,31 +804,53 @@ def run():
             processed += 1
 
     out_csv = os.path.join(root, OUT_BASENAME)
-    fieldnames = [
-        "file",
-        "url",
+    primary_fieldnames = [
+        "activate_date",
+        "id",
         "ad_id",
-        "title",
-        "property_type",
-        "address",
-        "state",
-        "subregion",
-        "subarea",
-        "location",
-        "lister",
-        "lister_url",
-        "phone_number",
+        "listing_id",
         "agency",
-        "agency_registration_number",
-        "ren",
-        "price",
-        "rooms",
-        "toilets",
-        "price_per_square_feet",
-        "furnishing",
-        "furnishing_source",
         "build_up",
         "land_area",
+        "car_park",
+        "currency",
+        "email",
+        "furnishing",
+        "lister",
+        "seller_name",
+        "market",
+        "phone_number",
+        "phone",
+        "phone_number2",
+        "posted_date",
+        "posted_time",
+        "created_time",
+        "price",
+        "property_type",
+        "region",
+        "ren",
+        "rent_sale",
+        "rooms",
+        "scrape_date",
+        "source",
+        "state",
+        "subregion",
+        "title",
+        "location",
+        "toilets",
+        "type",
+        "updated_date",
+        "url",
+    ]
+
+    extra_fieldnames = [
+        "file",
+        "address",
+        "subarea",
+        "lister_url",
+        "agency_registration_number",
+        "price_per_square_feet",
+        "furnishing_source",
         "tenure",
         "property_title",
         "bumi_lot",
@@ -731,6 +861,8 @@ def run():
         "facilities",
         "scrape_unix",
     ]
+
+    fieldnames = primary_fieldnames + extra_fieldnames
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

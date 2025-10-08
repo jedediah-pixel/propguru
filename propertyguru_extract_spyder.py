@@ -21,6 +21,7 @@ import zipfile
 import gzip
 import sys
 import time
+from datetime import datetime, timezone
 
 try:
     from bs4 import BeautifulSoup
@@ -199,6 +200,189 @@ def map_tenure(code):
         return ""
     up = str(code).strip().upper()
     return {"F": "Freehold", "L": "Leasehold"}.get(up, str(code))
+
+
+def _normalize_timestamp(unix_value):
+    if unix_value in (None, ""):
+        return None
+    try:
+        ts = float(unix_value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    if ts <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        try:
+            return datetime.utcfromtimestamp(ts)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+
+def _split_datetime_parts(dt):
+    if not dt:
+        return "", ""
+    return dt.date().isoformat(), dt.time().replace(microsecond=0).isoformat()
+
+
+def _parse_datetime_value(value):
+    if value in (None, ""):
+        return "", ""
+    if isinstance(value, (int, float)):
+        return _split_datetime_parts(_normalize_timestamp(value))
+
+    s = str(value).strip()
+    if not s:
+        return "", ""
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return _split_datetime_parts(dt)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return _split_datetime_parts(dt)
+        except ValueError:
+            continue
+
+    date_match = re.search(r"\d{4}-\d{2}-\d{2}", s)
+    time_match = re.search(r"\d{2}:\d{2}:\d{2}", s)
+    date_val = date_match.group(0) if date_match else ""
+    time_val = time_match.group(0) if time_match else ""
+    return date_val, time_val
+
+
+def _parse_human_readable_date(text):
+    if not text:
+        return ""
+    s = str(text)
+    for pattern in (
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}",
+        r"\d{1,2}\s+[A-Za-z]{4,9}\s+\d{4}",
+    ):
+        match = re.search(pattern, s)
+        if not match:
+            continue
+        raw = match.group(0)
+        for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.date().isoformat()
+            except ValueError:
+                continue
+    return ""
+
+
+def extract_posted_date_time(data):
+    last_posted_candidates = [
+        get_by_path(data, "lastPosted"),
+        get_by_path(data, "listingData.lastPosted"),
+        get_by_path(data, "propertyOverviewData.lastPosted"),
+    ]
+
+    for cand in last_posted_candidates:
+        if isinstance(cand, dict) and cand:
+            date_val, time_val = _split_datetime_parts(_normalize_timestamp(cand.get("unix")))
+            if not date_val:
+                date_val, time_val = _parse_datetime_value(cand.get("date"))
+            if date_val or time_val:
+                return date_val, time_val
+
+    metatable_items = get_by_path(data, "detailsData.metatable.items")
+    if isinstance(metatable_items, list):
+        for item in metatable_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("icon") == "calendar-time-o":
+                date_val = _parse_human_readable_date(item.get("value"))
+                if date_val:
+                    return date_val, ""
+                break
+
+    return "", ""
+
+
+def _normalize_rent_sale_value(value):
+    if value in (None, ""):
+        return ""
+
+    s = str(value).strip().lower()
+    if not s:
+        return ""
+
+    if re.search(r"\bsale\b", s):
+        return "sale"
+    if re.search(r"\brent\b", s) or re.search(r"\brental\b", s):
+        return "rent"
+
+    return ""
+
+
+def extract_rent_sale(data):
+    primary_val = _normalize_rent_sale_value(get_by_path(data, "listingData.listingType"))
+    if primary_val:
+        return primary_val
+
+    for path in (
+        "listingData.listingTypeText",
+        "listingData.listingTypeLocalizedText",
+    ):
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    url_val = get_by_path(data, "listingData.url")
+    url_norm = _normalize_rent_sale_value(url_val)
+    if url_norm:
+        return url_norm
+
+    breadcrumbs = get_by_path(data, "breadcrumbsData.items")
+    if isinstance(breadcrumbs, list):
+        for item in reversed(breadcrumbs):
+            if not isinstance(item, dict):
+                continue
+            val = _normalize_rent_sale_value(item.get("text"))
+            if val:
+                return val
+
+    backup_val = _normalize_rent_sale_value(get_by_path(data, "similarListingsData.listingType"))
+    if backup_val:
+        return backup_val
+
+    for path in RENT_SALE_PATHS:
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    return ""
+
+
+def extract_car_park(data):
+    meta_items = get_by_path(data, "detailsData.metatable.items")
+    if isinstance(meta_items, list):
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("value")
+            if not value:
+                continue
+            value_str = str(value)
+            if re.search(r"parking|car\s*park", value_str, re.I):
+                digits = digits_only(value_str)
+                if digits:
+                    return digits
+
+    fallback_val = pick_first(data, CAR_PARK_PATHS)
+    return digits_only(fallback_val)
 
 
 # Regexes used when filling details
@@ -500,14 +684,14 @@ CURRENCY_PATHS = [
     "listingData.currency",
 ]
 ROOMS_PATHS = [
-    "propertyOverviewData.propertyInfo.bedrooms",
-    "listingData.property.bedrooms",
     "listingData.bedrooms",
+    "listingData.property.bedrooms",
+    "propertyOverviewData.propertyInfo.bedrooms",
 ]
 TOILETS_PATHS = [
-    "propertyOverviewData.propertyInfo.bathrooms",
-    "listingData.property.bathrooms",
     "listingData.bathrooms",
+    "listingData.property.bathrooms",
+    "propertyOverviewData.propertyInfo.bathrooms",
 ]
 PSF_PATHS = [
     "propertyOverviewData.propertyInfo.price.perSqft",
@@ -681,13 +865,26 @@ def extract_row(name, payload, payload_type):
     listing_id = str(listing.get("listingId") or "")
     ad_identifier = str(listing.get("adId") or listing_uuid or listing_id or "")
 
-    posted_date_val = str(pick_first(data, POSTED_DATE_PATHS) or listing.get("publishedDate") or listing.get("postedDate") or "")
-    posted_time_val = str(pick_first(data, POSTED_TIME_PATHS) or listing.get("publishedTime") or listing.get("postedTime") or "")
+    posted_date_val, posted_time_val = extract_posted_date_time(data)
+    if not posted_date_val:
+        posted_date_val = str(
+            pick_first(data, POSTED_DATE_PATHS)
+            or listing.get("publishedDate")
+            or listing.get("postedDate")
+            or ""
+        )
+    if not posted_time_val:
+        posted_time_val = str(
+            pick_first(data, POSTED_TIME_PATHS)
+            or listing.get("publishedTime")
+            or listing.get("postedTime")
+            or ""
+        )
     created_time_val = str(pick_first(data, CREATED_TIME_PATHS) or listing.get("createdAt") or listing.get("createdDate") or listing.get("createTime") or "")
     updated_date_val = str(pick_first(data, UPDATED_DATE_PATHS) or listing.get("updatedAt") or listing.get("updatedDate") or listing.get("updateTime") or "")
     activate_date_val = str(pick_first(data, ACTIVATE_DATE_PATHS) or listing.get("activateDate") or listing.get("activationDate") or "")
 
-    car_park_val = str(pick_first(data, CAR_PARK_PATHS) or "")
+    car_park_val = extract_car_park(data)
     currency_val = "RM"
     email_val = str(pick_first(data, EMAIL_PATHS) or "")
     seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
@@ -695,7 +892,7 @@ def extract_row(name, payload, payload_type):
     phone_primary = str(pick_first(data, PHONE_PATHS) or "")
     phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
     region_val = str(pick_first(data, REGION_PATHS) or "")
-    rent_sale_val = ""
+    rent_sale_val = extract_rent_sale(data)
     type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
 
     scrape_unix = int(time.time())
@@ -844,28 +1041,28 @@ def run():
     ]
 
     extra_fieldnames = [
-        "file",
-        "address",
-        "subarea",
-        "lister_url",
-        "agency_registration_number",
-        "price_per_square_feet",
-        "furnishing_source",
-        "tenure",
-        "property_title",
-        "bumi_lot",
-        "total_units",
-        "completion_year",
-        "developer",
-        "amenities",
-        "facilities",
-        "scrape_unix",
+        # "file",
+        # "address",
+        # "subarea",
+        # "lister_url",
+        # "agency_registration_number",
+        # "price_per_square_feet",
+        # "furnishing_source",
+        # "tenure",
+        # "property_title",
+        # "bumi_lot",
+        # "total_units",
+        # "completion_year",
+        # "developer",
+        # "amenities",
+        # "facilities",
+        # "scrape_unix",
     ]
 
     fieldnames = primary_fieldnames + extra_fieldnames
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 

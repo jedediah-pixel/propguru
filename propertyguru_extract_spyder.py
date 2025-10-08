@@ -844,28 +844,28 @@ def run():
     ]
 
     extra_fieldnames = [
-        "file",
-        "address",
-        "subarea",
-        "lister_url",
-        "agency_registration_number",
-        "price_per_square_feet",
-        "furnishing_source",
-        "tenure",
-        "property_title",
-        "bumi_lot",
-        "total_units",
-        "completion_year",
-        "developer",
-        "amenities",
-        "facilities",
-        "scrape_unix",
+        # "file",
+        # "address",
+        # "subarea",
+        # "lister_url",
+        # "agency_registration_number",
+        # "price_per_square_feet",
+        # "furnishing_source",
+        # "tenure",
+        # "property_title",
+        # "bumi_lot",
+        # "total_units",
+        # "completion_year",
+        # "developer",
+        # "amenities",
+        # "facilities",
+        # "scrape_unix",
     ]
 
     fieldnames = primary_fieldnames + extra_fieldnames
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 

@@ -62,6 +62,69 @@ def pick_root_if_needed(root):
         if os.path.isdir(folder):
             return folder
         print("Path not found. Try again.\n")
+        
+# --- MARKET HELPERS START ---
+def _normalize_market(val: str) -> str:
+    t = (val or "").strip().lower()
+    if not t:
+        return ""
+    if "commer" in t:
+        return "commercial"
+    if "resid" in t:
+        return "residential"
+    return ""
+
+def market_from_filename(name: str) -> str:
+    base = os.path.basename(name)
+    # strip multi-extensions (e.g., .json.gz)
+    while True:
+        root, ext = os.path.splitext(base)
+        if not ext:
+            break
+        base = root
+    m = re.search(r"_(commercial|residential)(?:_|$)", base, flags=re.I)
+    return (m.group(1).lower() if m else "")
+
+def derive_market_from_json(data: dict) -> str:
+    # 1) Direct market fields (your MARKET_PATHS)
+    direct = _normalize_market(pick_first(data, MARKET_PATHS))
+    if direct:
+        return direct
+
+    # 2) Property type/code heuristics
+    listing = (data.get("listingData") or {})
+    pt = (listing.get("propertyType") or "").strip().lower()
+    pt_code = (listing.get("propertyTypeCode") or "").strip().lower()
+    comm_tokens = {
+        "shop","office","retail","industrial","factory","warehouse",
+        "commercial","sofo","sovo","hotel","mall","commercial land","boutique office"
+    }
+    res_tokens = {
+        "condo","apartment","serviced residence","service residence","terrace",
+        "terraced","semi-d","semi detached","bungalow","townhouse","flat",
+        "residential","link house","cluster","duplex","studio"
+    }
+    joined = f"{pt} {pt_code}"
+    if any(tok in joined for tok in comm_tokens):
+        return "commercial"
+    if any(tok in joined for tok in res_tokens):
+        return "residential"
+
+    # 3) Metatable first row (e.g., "Shop for sale", "Condominium for rent")
+    items = (((data.get("detailsData") or {}).get("metatable") or {}).get("items") or [])
+    if items:
+        first_val = str(items[0].get("value") or "").lower()
+        norm = _normalize_market(first_val)
+        if norm:
+            return norm
+        if any(tok in first_val for tok in comm_tokens):
+            return "commercial"
+        if any(tok in first_val for tok in res_tokens):
+            return "residential"
+
+    return ""
+# --- MARKET HELPERS END ---
+
 
 # ------------------- JSON HELPERS -------------------
 def _iter_script_jsons(soup):
@@ -888,7 +951,10 @@ def extract_row(name, payload, payload_type):
     currency_val = "RM"
     email_val = str(pick_first(data, EMAIL_PATHS) or "")
     seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
-    market_val = str(pick_first(data, MARKET_PATHS) or "")
+    market_val = market_from_filename(name) or derive_market_from_json(data) or ""
+    if market_val not in ("commercial", "residential"):
+        market_val = ""
+
     phone_primary = str(pick_first(data, PHONE_PATHS) or "")
     phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
     region_val = str(pick_first(data, REGION_PATHS) or "")

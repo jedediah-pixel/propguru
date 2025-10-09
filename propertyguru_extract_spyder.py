@@ -813,6 +813,39 @@ def _detect_payload_type(text, explicit=None):
     return "html"
 
 
+def _file_created_datetime(path):
+    try:
+        ts = os.path.getctime(path)
+    except Exception:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def _zipinfo_created_datetime(info, fallback=None):
+    try:
+        dt = datetime(*info.date_time)
+    except Exception:
+        return fallback
+    try:
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return fallback
+
+
+def _format_scrape_date(dt):
+    if not dt:
+        return ""
+    try:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def iter_payloads(root):
     for dirpath, dirnames, filenames in os.walk(root):
         for fn in filenames:
@@ -823,7 +856,7 @@ def iter_payloads(root):
                 try:
                     with open(path, "r", encoding="utf-8") as fh:
                         text = fh.read()
-                    yield path, text, "json"
+                    yield path, text, "json", _file_created_datetime(path)
                 except Exception:
                     continue
                 continue
@@ -833,7 +866,7 @@ def iter_payloads(root):
                     with open(path, "rb") as fh:
                         blob = fh.read()
                     text = gzip.decompress(blob).decode("utf-8", "ignore")
-                    yield path, text, _detect_payload_type(text, "json" if lower.endswith(".json.gz") else None)
+                    yield path, text, _detect_payload_type(text, "json" if lower.endswith(".json.gz") else None), _file_created_datetime(path)
                 except Exception:
                     continue
                 continue
@@ -841,7 +874,9 @@ def iter_payloads(root):
             if lower.endswith(".zip"):
                 try:
                     with zipfile.ZipFile(path) as z:
-                        for n in z.namelist():
+                        archive_dt = _file_created_datetime(path)
+                        for info in z.infolist():
+                            n = info.filename
                             n_lower = n.lower()
                             try:
                                 text = z.read(n).decode("utf-8", "ignore")
@@ -852,7 +887,12 @@ def iter_payloads(root):
                                 explicit = "json"
                             elif n_lower.endswith((".html", ".htm")):
                                 explicit = "html"
-                            yield f"{path}|{n}", text, _detect_payload_type(text, explicit)
+                            yield (
+                                f"{path}|{n}",
+                                text,
+                                _detect_payload_type(text, explicit),
+                                _zipinfo_created_datetime(info, archive_dt),
+                            )
                 except Exception:
                     continue
                 continue
@@ -861,13 +901,13 @@ def iter_payloads(root):
                 try:
                     with open(path, "rb") as fh:
                         html = fh.read().decode("utf-8", "ignore")
-                    yield path, html, "html"
+                    yield path, html, "html", _file_created_datetime(path)
                 except Exception:
                     continue
 
 
 # ------------------- MAIN EXTRACTION -------------------
-def extract_row(name, payload, payload_type):
+def extract_row(name, payload, payload_type, created_dt=None):
     soup = None
     data = {}
 
@@ -962,7 +1002,7 @@ def extract_row(name, payload, payload_type):
     type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
 
     scrape_unix = int(time.time())
-    scrape_date_val = ""
+    scrape_date_val = _format_scrape_date(created_dt) if payload_type == "json" else ""
 
     row = {
         "activate_date": activate_date_val,
@@ -1055,10 +1095,10 @@ def run():
     processed = 0
     print(f"Scanning: {root}")
 
-    for name, payload, payload_type in iter_payloads(root):
+    for name, payload, payload_type, created_dt in iter_payloads(root):
         seen += 1
         try:
-            row = extract_row(name, payload, payload_type)
+            row = extract_row(name, payload, payload_type, created_dt)
         except Exception as exc:
             print(f"[WARN] {name}: {exc}")
             row = None

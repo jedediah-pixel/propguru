@@ -10,7 +10,7 @@ Two-Phase PropertyGuru Runner: ADLIST (SRP) -> ADVIEW (Detail)
 """
 
 import os, re, io, time, json, math, gzip, zipfile, random, queue, heapq, threading, logging, shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
@@ -766,33 +766,625 @@ def find_state_in_address(address: str) -> str:
     return ""
 
 
+def _normalize_market(val: str) -> str:
+    t = (val or "").strip().lower()
+    if not t:
+        return ""
+    if "commer" in t:
+        return "commercial"
+    if "resid" in t:
+        return "residential"
+    return ""
+
+
+def market_from_filename(name: str) -> str:
+    base = os.path.basename(name)
+    while True:
+        root, ext = os.path.splitext(base)
+        if not ext:
+            break
+        base = root
+    m = re.search(r"_(commercial|residential)(?:_|$)", base, flags=re.I)
+    return (m.group(1).lower() if m else "")
+
+
+def derive_market_from_json(data: dict) -> str:
+    direct = _normalize_market(pick_first(data, MARKET_PATHS))
+    if direct:
+        return direct
+
+    listing = (data.get("listingData") or {})
+    pt = (listing.get("propertyType") or "").strip().lower()
+    pt_code = (listing.get("propertyTypeCode") or "").strip().lower()
+    comm_tokens = {
+        "shop", "office", "retail", "industrial", "factory", "warehouse",
+        "commercial", "sofo", "sovo", "hotel", "mall", "commercial land", "boutique office",
+    }
+    res_tokens = {
+        "condo", "apartment", "serviced residence", "service residence", "terrace",
+        "terraced", "semi-d", "semi detached", "bungalow", "townhouse", "flat",
+        "residential", "link house", "cluster", "duplex", "studio",
+    }
+    joined = f"{pt} {pt_code}"
+    if any(tok in joined for tok in comm_tokens):
+        return "commercial"
+    if any(tok in joined for tok in res_tokens):
+        return "residential"
+
+    items = (((data.get("detailsData") or {}).get("metatable") or {}).get("items") or [])
+    if items:
+        first_val = str(items[0].get("value") or "").lower()
+        norm = _normalize_market(first_val)
+        if norm:
+            return norm
+        if any(tok in first_val for tok in comm_tokens):
+            return "commercial"
+        if any(tok in first_val for tok in res_tokens):
+            return "residential"
+
+    return ""
+
+
+def _normalize_timestamp(unix_value):
+    if unix_value in (None, ""):
+        return None
+    try:
+        ts = float(unix_value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    if ts <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        try:
+            return datetime.utcfromtimestamp(ts)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+
+def _split_datetime_parts(dt):
+    if not dt:
+        return "", ""
+    return dt.date().isoformat(), dt.time().replace(microsecond=0).isoformat()
+
+
+def _parse_datetime_value(value):
+    if value in (None, ""):
+        return "", ""
+    if isinstance(value, (int, float)):
+        return _split_datetime_parts(_normalize_timestamp(value))
+
+    s = str(value).strip()
+    if not s:
+        return "", ""
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return _split_datetime_parts(dt)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return _split_datetime_parts(dt)
+        except ValueError:
+            continue
+
+    date_match = re.search(r"\d{4}-\d{2}-\d{2}", s)
+    time_match = re.search(r"\d{2}:\d{2}:\d{2}", s)
+    date_val = date_match.group(0) if date_match else ""
+    time_val = time_match.group(0) if time_match else ""
+    return date_val, time_val
+
+
+def _parse_human_readable_date(text):
+    if not text:
+        return ""
+    s = str(text)
+    for pattern in (
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{1,2}\s+[A-Za-z]{3}\s+\d{4}",
+        r"\d{1,2}\s+[A-Za-z]{4,9}\s+\d{4}",
+    ):
+        match = re.search(pattern, s)
+        if not match:
+            continue
+        raw = match.group(0)
+        for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.date().isoformat()
+            except ValueError:
+                continue
+    return ""
+
+
+def extract_posted_date_time(data):
+    last_posted_candidates = [
+        get_by_path(data, "lastPosted"),
+        get_by_path(data, "listingData.lastPosted"),
+        get_by_path(data, "propertyOverviewData.lastPosted"),
+    ]
+
+    for cand in last_posted_candidates:
+        if isinstance(cand, dict) and cand:
+            date_val, time_val = _split_datetime_parts(_normalize_timestamp(cand.get("unix")))
+            if not date_val:
+                date_val, time_val = _parse_datetime_value(cand.get("date"))
+            if date_val or time_val:
+                return date_val, time_val
+
+    metatable_items = get_by_path(data, "detailsData.metatable.items")
+    if isinstance(metatable_items, list):
+        for item in metatable_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("icon") == "calendar-time-o":
+                date_val = _parse_human_readable_date(item.get("value"))
+                if date_val:
+                    return date_val, ""
+                break
+
+    return "", ""
+
+
+def _normalize_rent_sale_value(value):
+    if value in (None, ""):
+        return ""
+
+    s = str(value).strip().lower()
+    if not s:
+        return ""
+
+    if re.search(r"\bsale\b", s):
+        return "sale"
+    if re.search(r"\brent\b", s) or re.search(r"\brental\b", s):
+        return "rent"
+
+    return ""
+
+
+def extract_rent_sale(data):
+    primary_val = _normalize_rent_sale_value(get_by_path(data, "listingData.listingType"))
+    if primary_val:
+        return primary_val
+
+    for path in (
+        "listingData.listingTypeText",
+        "listingData.listingTypeLocalizedText",
+    ):
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    url_val = get_by_path(data, "listingData.url")
+    url_norm = _normalize_rent_sale_value(url_val)
+    if url_norm:
+        return url_norm
+
+    breadcrumbs = get_by_path(data, "breadcrumbsData.items")
+    if isinstance(breadcrumbs, list):
+        for item in reversed(breadcrumbs):
+            if not isinstance(item, dict):
+                continue
+            val = _normalize_rent_sale_value(item.get("text"))
+            if val:
+                return val
+
+    backup_val = _normalize_rent_sale_value(get_by_path(data, "similarListingsData.listingType"))
+    if backup_val:
+        return backup_val
+
+    for path in RENT_SALE_PATHS:
+        val = _normalize_rent_sale_value(get_by_path(data, path))
+        if val:
+            return val
+
+    return ""
+
+
+def extract_car_park(data):
+    meta_items = get_by_path(data, "detailsData.metatable.items")
+    if isinstance(meta_items, list):
+        for item in meta_items:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("value")
+            if not value:
+                continue
+            value_str = str(value)
+            if re.search(r"parking|car\s*park", value_str, re.I):
+                digits = digits_only(value_str)
+                if digits:
+                    return digits
+
+    fallback_val = pick_first(data, CAR_PARK_PATHS)
+    return digits_only(fallback_val)
+
+
 # Candidate paths
-URL_PATHS   = ["listingData.url"]
-TITLE_PATHS = ["listingData.localizedTitle", "listingData.title"]
-PROPERTY_TYPE_PATHS = ["propertyOverviewData.propertyInfo.propertyType","listingData.propertyType","listingData.property.typeText","listingData.property.type"]
-ADDRESS_PATHS = ["propertyOverviewData.propertyInfo.fullAddress","listingData.displayAddress","listingData.address","listingData.property.addressText"]
-STATE_PATHS   = ["propertyOverviewData.propertyInfo.stateName","listingData.property.stateName","listingData.stateName"]
-DISTRICT_PATHS= ["propertyOverviewData.propertyInfo.districtName","listingData.property.districtName","listingData.districtName","listingData.districtText"]
-SUBAREA_PATHS = ["propertyOverviewData.propertyInfo.areaName","listingData.property.areaName","listingData.areaName","listingData.areaText"]
-LISTER_NAME_PATHS = ["contactAgentData.contactAgentCard.agentInfoProps.agent.name","listingData.agent.name"]
-LISTER_URL_PATHS  = ["contactAgentData.contactAgentCard.agentInfoProps.agent.profileUrl","listingData.agent.profileUrl","listingData.agent.url"]
-PHONE_PATHS = ["contactAgentData.contactAgentCard.agentInfoProps.agent.mobile","listingData.agent.contactNumbers.0.number","listingData.agent.contactNumbers.0.displayNumber","listingData.agent.phoneNumber","listingData.agent.mobile","listingData.agent.contactNumber"]
-AGENCY_NAME_PATHS = ["contactAgentData.contactAgentCard.agency.name","listingData.agent.agency.name","listingData.agent.agencyName"]
-AGENCY_REG_PATHS  = ["contactAgentData.contactAgentCard.agency.registrationNumber","contactAgentData.contactAgentCard.agency.licenseNo","listingData.agent.agency.registrationNumber","listingData.agent.agency.registrationNo","listingData.agent.agency.regNo"]
-REN_PATHS = ["listingData.agent.licenseNumber","listingData.agent.renNo","listingData.agent.registrationNo","listingData.agent.ren","contactAgentData.contactAgentCard.agentInfoProps.agent.licenseNumber"]
-PRICE_PATHS = ["propertyOverviewData.propertyInfo.price.amount","listingData.priceValue","listingData.pricePretty","listingData.price"]
-ROOMS_PATHS = ["propertyOverviewData.propertyInfo.bedrooms","listingData.property.bedrooms","listingData.bedrooms"]
-TOILETS_PATHS = ["propertyOverviewData.propertyInfo.bathrooms","listingData.property.bathrooms","listingData.bathrooms"]
-PSF_PATHS = ["propertyOverviewData.propertyInfo.price.perSqft","propertyOverviewData.propertyInfo.pricePerSqft","listingData.floorAreaPsf"]
-# FURNISHING_PATHS = ["propertyOverviewData.propertyInfo.furnishing","listingData.property.furnishing","listingData.furnishing"]
-FLOOR_AREA_PATHS = ["propertyOverviewData.propertyInfo.builtUp.size","propertyOverviewData.propertyInfo.builtUpSqft","listingData.floorArea","listingData.property.builtUpArea"]
-LAND_AREA_PATHS  = ["propertyOverviewData.propertyInfo.landArea.size","propertyOverviewData.propertyInfo.landAreaSqft","listingData.landArea","listingData.property.landArea"]
-TENURE_PATHS = ["propertyOverviewData.propertyInfo.tenure","listingData.property.tenure","listingData.tenure"]
-PROPERTY_TITLE_PATHS = ["propertyOverviewData.propertyInfo.titleType","listingData.property.titleType","listingData.property.title"]
-BUMI_PATHS = ["propertyOverviewData.propertyInfo.bumiLot","listingData.property.bumiLot"]
-TOTAL_UNITS_PATHS = ["propertyOverviewData.propertyInfo.totalUnits","listingData.property.totalUnits"]
-COMPLETION_YEAR_PATHS = ["propertyOverviewData.propertyInfo.completedYear","propertyOverviewData.propertyInfo.completionYear","listingData.property.completedYear","listingData.property.yearBuilt"]
-DEVELOPER_PATHS = ["propertyOverviewData.propertyInfo.developer","listingData.property.developer"]
+URL_PATHS = ["listingData.url"]
+TITLE_PATHS = [
+    "listingData.localizedTitle",
+    "listingData.title",
+]
+PROPERTY_TYPE_PATHS = [
+    "propertyOverviewData.propertyInfo.propertyType",
+    "listingData.propertyType",
+    "listingData.property.typeText",
+    "listingData.property.type",
+]
+ADDRESS_PATHS = [
+    "propertyOverviewData.propertyInfo.fullAddress",
+    "listingData.displayAddress",
+    "listingData.address",
+    "listingData.property.addressText",
+]
+STATE_PATHS = [
+    "propertyOverviewData.propertyInfo.stateName",
+    "listingData.property.stateName",
+    "listingData.stateName",
+]
+DISTRICT_PATHS = [
+    "propertyOverviewData.propertyInfo.districtName",
+    "listingData.property.districtName",
+    "listingData.districtName",
+    "listingData.districtText",
+]
+SUBAREA_PATHS = [
+    "propertyOverviewData.propertyInfo.areaName",
+    "listingData.property.areaName",
+    "listingData.areaName",
+    "listingData.areaText",
+]
+LISTER_NAME_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.name",
+    "listingData.agent.name",
+]
+LISTER_URL_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.profileUrl",
+    "listingData.agent.profileUrl",
+    "listingData.agent.url",
+]
+PHONE_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.mobile",
+    "listingData.agent.contactNumbers.0.number",
+    "listingData.agent.contactNumbers.0.displayNumber",
+    "listingData.agent.phoneNumber",
+    "listingData.agent.mobile",
+    "listingData.agent.contactNumber",
+]
+PHONE2_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.phone",
+    "listingData.agent.contactNumbers.1.number",
+    "listingData.agent.contactNumbers.1.displayNumber",
+    "listingData.agent.secondaryPhone",
+]
+AGENCY_NAME_PATHS = [
+    "contactAgentData.contactAgentCard.agency.name",
+    "listingData.agent.agency.name",
+    "listingData.agent.agencyName",
+]
+AGENCY_REG_PATHS = [
+    "contactAgentData.contactAgentCard.agency.registrationNumber",
+    "contactAgentData.contactAgentCard.agency.licenseNo",
+    "listingData.agent.agency.registrationNumber",
+    "listingData.agent.agency.registrationNo",
+    "listingData.agent.agency.regNo",
+]
+REN_PATHS = [
+    "listingData.agent.licenseNumber",
+    "listingData.agent.renNo",
+    "listingData.agent.registrationNo",
+    "listingData.agent.ren",
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.licenseNumber",
+]
+PRICE_PATHS = [
+    "propertyOverviewData.propertyInfo.price.amount",
+    "listingData.priceValue",
+    "listingData.pricePretty",
+    "listingData.price",
+]
+CAR_PARK_PATHS = [
+    "propertyOverviewData.propertyInfo.carPark",
+    "listingData.property.carPark",
+    "listingData.carPark",
+    "listingData.carParks",
+]
+EMAIL_PATHS = [
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.email",
+    "listingData.agent.email",
+]
+SELLER_NAME_PATHS = [
+    "listingData.sellerName",
+    "contactAgentData.contactAgentCard.agentInfoProps.agent.sellerName",
+]
+MARKET_PATHS = [
+    "listingData.market",
+    "propertyOverviewData.propertyInfo.market",
+]
+REGION_PATHS = [
+    "listingData.regionName",
+    "propertyOverviewData.propertyInfo.regionName",
+]
+RENT_SALE_PATHS = [
+    "listingData.listingType",
+    "listingData.purpose",
+    "listingData.transactionType",
+]
+TYPE_PATHS = [
+    "listingData.type",
+    "listingData.property.listingType",
+]
+POSTED_DATE_PATHS = [
+    "listingData.publishedDate",
+    "listingData.postedDate",
+]
+POSTED_TIME_PATHS = [
+    "listingData.publishedTime",
+    "listingData.postedTime",
+]
+CREATED_TIME_PATHS = [
+    "listingData.createdAt",
+    "listingData.createdDate",
+    "listingData.createTime",
+]
+UPDATED_DATE_PATHS = [
+    "listingData.updatedAt",
+    "listingData.updatedDate",
+    "listingData.updateTime",
+]
+ACTIVATE_DATE_PATHS = [
+    "listingData.activateDate",
+    "listingData.activationDate",
+]
+CURRENCY_PATHS = [
+    "propertyOverviewData.propertyInfo.price.currency",
+    "listingData.currency",
+]
+ROOMS_PATHS = [
+    "listingData.bedrooms",
+    "listingData.property.bedrooms",
+    "propertyOverviewData.propertyInfo.bedrooms",
+]
+TOILETS_PATHS = [
+    "listingData.bathrooms",
+    "listingData.property.bathrooms",
+    "propertyOverviewData.propertyInfo.bathrooms",
+]
+PSF_PATHS = [
+    "propertyOverviewData.propertyInfo.price.perSqft",
+    "propertyOverviewData.propertyInfo.pricePerSqft",
+    "listingData.floorAreaPsf",
+]
+FLOOR_AREA_PATHS = [
+    "propertyOverviewData.propertyInfo.builtUp.size",
+    "propertyOverviewData.propertyInfo.builtUpSqft",
+    "listingData.floorArea",
+    "listingData.property.builtUpArea",
+]
+LAND_AREA_PATHS = [
+    "propertyOverviewData.propertyInfo.landArea.size",
+    "propertyOverviewData.propertyInfo.landAreaSqft",
+    "listingData.landArea",
+    "listingData.property.landArea",
+]
+TENURE_PATHS = [
+    "propertyOverviewData.propertyInfo.tenure",
+    "listingData.property.tenure",
+    "listingData.tenure",
+]
+PROPERTY_TITLE_PATHS = [
+    "propertyOverviewData.propertyInfo.titleType",
+    "listingData.property.titleType",
+    "listingData.property.title",
+]
+BUMI_PATHS = [
+    "propertyOverviewData.propertyInfo.bumiLot",
+    "listingData.property.bumiLot",
+]
+TOTAL_UNITS_PATHS = [
+    "propertyOverviewData.propertyInfo.totalUnits",
+    "listingData.property.totalUnits",
+]
+COMPLETION_YEAR_PATHS = [
+    "propertyOverviewData.propertyInfo.completedYear",
+    "propertyOverviewData.propertyInfo.completionYear",
+    "listingData.property.completedYear",
+    "listingData.property.yearBuilt",
+]
+DEVELOPER_PATHS = [
+    "propertyOverviewData.propertyInfo.developer",
+    "listingData.property.developer",
+]
+
+
+def build_adview_row(
+    data: dict,
+    *,
+    raw_filename: str = "",
+    url_fallback: str = "",
+    ad_id_hint=None,
+    intent: str = "",
+    segment: str = "",
+):
+    listing = data.get("listingData", {}) or {}
+    property_info = ((data.get("propertyOverviewData") or {}).get("propertyInfo")) or {}
+
+    url = make_abs(pick_first(data, URL_PATHS)) or url_fallback or ""
+    title = pick_first(data, TITLE_PATHS) or (listing.get("property") or {}).get("typeText") or ""
+
+    address = pick_first(data, ADDRESS_PATHS)
+    state = pick_first(data, STATE_PATHS)
+    if not state:
+        state = find_state_in_address(address)
+    district = pick_first(data, DISTRICT_PATHS)
+    subarea = pick_first(data, SUBAREA_PATHS)
+
+    location_parts = [p for p in [subarea, district, state] if p]
+    if address and state and district:
+        location = f"{subarea + ', ' if subarea else ''}{district}, {state}"
+    else:
+        location = ", ".join(location_parts) if location_parts else (address or "")
+
+    furnishing, furnishing_source = extract_furnishing(data)
+
+    listing_uuid = str(listing.get("id") or "")
+    listing_id = str(listing.get("listingId") or "")
+    ad_identifier = str(listing.get("adId") or listing_uuid or listing_id or ad_id_hint or "")
+
+    posted_date_val, posted_time_val = extract_posted_date_time(data)
+    if not posted_date_val:
+        posted_date_val = str(
+            pick_first(data, POSTED_DATE_PATHS)
+            or listing.get("publishedDate")
+            or listing.get("postedDate")
+            or ""
+        )
+    if not posted_time_val:
+        posted_time_val = str(
+            pick_first(data, POSTED_TIME_PATHS)
+            or listing.get("publishedTime")
+            or listing.get("postedTime")
+            or ""
+        )
+
+    created_time_val = str(
+        pick_first(data, CREATED_TIME_PATHS)
+        or listing.get("createdAt")
+        or listing.get("createdDate")
+        or listing.get("createTime")
+        or ""
+    )
+    updated_date_val = str(
+        pick_first(data, UPDATED_DATE_PATHS)
+        or listing.get("updatedAt")
+        or listing.get("updatedDate")
+        or listing.get("updateTime")
+        or ""
+    )
+    activate_date_val = str(
+        pick_first(data, ACTIVATE_DATE_PATHS)
+        or listing.get("activateDate")
+        or listing.get("activationDate")
+        or ""
+    )
+
+    car_park_val = extract_car_park(data)
+    currency_val = pick_first(data, CURRENCY_PATHS) or "RM"
+    email_val = str(pick_first(data, EMAIL_PATHS) or "")
+    seller_name_val = str(pick_first(data, SELLER_NAME_PATHS) or "")
+
+    market_val = (
+        market_from_filename(raw_filename)
+        or derive_market_from_json(data)
+        or _normalize_market(segment)
+    )
+    if market_val not in ("commercial", "residential"):
+        market_val = ""
+
+    phone_primary = str(pick_first(data, PHONE_PATHS) or "")
+    phone_secondary = str(pick_first(data, PHONE2_PATHS) or "")
+    region_val = str(pick_first(data, REGION_PATHS) or "")
+    rent_sale_val = extract_rent_sale(data)
+    if not rent_sale_val:
+        rent_sale_val = _normalize_rent_sale_value(intent)
+    type_val = str(pick_first(data, TYPE_PATHS) or listing.get("type") or "")
+
+    scrape_unix = int(time.time())
+    scrape_date_val = datetime.now(timezone.utc).date().isoformat()
+
+    price_val = parse_money_value(pick_first(data, PRICE_PATHS))
+
+    row = {
+        "activate_date": activate_date_val,
+        "ad_id": ad_identifier,
+        "agency": pick_first(data, AGENCY_NAME_PATHS) or "",
+        "build_up": digits_only(pick_first(data, FLOOR_AREA_PATHS)),
+        "car_park": car_park_val,
+        "created_time": created_time_val,
+        "currency": currency_val,
+        "email": email_val,
+        "furnishing": furnishing,
+        "id": f"pg_{ad_identifier}" if ad_identifier else "",
+        "land_area": digits_only(pick_first(data, LAND_AREA_PATHS)),
+        "lister": pick_first(data, LISTER_NAME_PATHS) or "",
+        "listing_id": listing_id,
+        "location": location or "",
+        "market": market_val,
+        "phone": phone_primary or phone_secondary,
+        "phone_number": phone_primary,
+        "phone_number2": phone_secondary,
+        "posted_date": posted_date_val,
+        "posted_time": posted_time_val,
+        "price": price_val,
+        "property_type": pick_first(data, PROPERTY_TYPE_PATHS) or "",
+        "region": region_val,
+        "ren": str(pick_first(data, REN_PATHS) or ""),
+        "rent_sale": rent_sale_val,
+        "rooms": str(pick_first(data, ROOMS_PATHS) or ""),
+        "scrape_date": scrape_date_val,
+        "seller_name": seller_name_val,
+        "source": "propertyguru.com.my",
+        "state": state or "",
+        "subregion": district or "",
+        "title": title or "",
+        "toilets": str(pick_first(data, TOILETS_PATHS) or ""),
+        "type": type_val,
+        "url": url or "",
+        "updated_date": updated_date_val,
+    }
+
+    row.update({
+        "file": raw_filename,
+        "address": address or "",
+        "subarea": subarea or "",
+        "lister_url": make_abs(pick_first(data, LISTER_URL_PATHS)) or "",
+        "agency_registration_number": pick_first(data, AGENCY_REG_PATHS) or "",
+        "price_per_square_feet": digits_only(pick_first(data, PSF_PATHS)),
+        "furnishing_source": furnishing_source,
+        "tenure": map_tenure(pick_first(data, TENURE_PATHS)),
+        "property_title": pick_first(data, PROPERTY_TITLE_PATHS) or "",
+        "bumi_lot": pick_first(data, BUMI_PATHS) or "",
+        "total_units": str(pick_first(data, TOTAL_UNITS_PATHS) or ""),
+        "completion_year": digits_only(pick_first(data, COMPLETION_YEAR_PATHS)),
+        "developer": pick_first(data, DEVELOPER_PATHS) or "",
+        "amenities": build_amenities(property_info),
+        "facilities": build_facilities(data),
+        "scrape_unix": scrape_unix,
+        "intent": intent,
+        "segment": segment,
+    })
+
+    seed = {
+        "property_title": row["property_title"],
+        "bumi_lot": row["bumi_lot"],
+        "developer": row["developer"],
+        "completion_year": row["completion_year"],
+        "build_up": row["build_up"],
+        "land_area": row["land_area"],
+        "price_per_square_feet": row["price_per_square_feet"],
+        "tenure": row["tenure"],
+        "furnishing": row["furnishing"],
+    }
+    seed = fill_from_details(iter_detail_strings(data), seed)
+    row["property_title"] = seed["property_title"] or row["property_title"]
+    row["bumi_lot"] = seed["bumi_lot"] or row["bumi_lot"]
+    row["developer"] = seed["developer"] or row["developer"]
+    row["completion_year"] = seed["completion_year"] or row["completion_year"]
+    row["build_up"] = seed["build_up"] or row["build_up"]
+    row["land_area"] = seed["land_area"] or row["land_area"]
+    row["price_per_square_feet"] = seed["price_per_square_feet"] or row["price_per_square_feet"]
+    row["tenure"] = seed["tenure"] or row["tenure"]
+    row["furnishing"] = seed["furnishing"] or row["furnishing"]
+
+    return row
 
 # ====== Dashboard Builder ======
 def build_dashboard_text(adlist: Stage, adview: Stage, phase:str) -> str:
@@ -1138,88 +1730,19 @@ def adview_worker(thread_id:int, stage: Stage, retry_bot: DiscordClient, exhaust
                 with open(os.path.join(ADVIEW_DIR, raw_name), "w", encoding="utf-8") as f:
                     f.write(text)
 
-                # ---- Rich field extraction ----
-                ld = dd.get("listingData", {}) or {}
-                property_info = (dd.get("propertyOverviewData", {}) or {}).get("propertyInfo", {}) or {}
-                row = {}
-                row["url"]   = make_abs(pick_first(dd, URL_PATHS)) or url
-                row["ad_id"] = ad_id
-                row["title"] = (pick_first(dd, TITLE_PATHS) or (ld.get("property") or {}).get("typeText") or "")
+                if not dd and isinstance(data, dict):
+                    dd = data
 
-                address = pick_first(dd, ADDRESS_PATHS)
-                state   = pick_first(dd, STATE_PATHS)
-                if not state:
-                    state = find_state_in_address(address)  # safer than last_token()
-                district= pick_first(dd, DISTRICT_PATHS)
-                subarea = pick_first(dd, SUBAREA_PATHS)
-
-                row["property_type"] = pick_first(dd, PROPERTY_TYPE_PATHS) or ""
-                row["address"] = address or ""
-                row["state"], row["subregion"], row["subarea"] = state or "", district or "", subarea or ""
-
-                # Location (robust, combined)
-                if address and state and district:
-                    row["location"] = f"{subarea+', ' if subarea else ''}{district}, {state}"
-                else:
-                    parts = [p for p in [subarea, district, state] if p]
-                    row["location"] = ", ".join(parts) if parts else address or ""
-
-                # Lister & agency
-                row["lister"] = pick_first(dd, LISTER_NAME_PATHS) or ""
-                row["lister_url"]  = make_abs(pick_first(dd, LISTER_URL_PATHS)) or ""
-                row["phone_number"]= str(pick_first(dd, PHONE_PATHS) or "")
-                row["agency"]      = pick_first(dd, AGENCY_NAME_PATHS) or ""
-                row["agency_registration_number"] = pick_first(dd, AGENCY_REG_PATHS) or ""
-                row["ren"]  = str(pick_first(dd, REN_PATHS) or "")
-
-                # Price & core numbers
-                # Prefer numeric fields first; only parse pretty as a fallback
-                price_raw = pick_first(dd, ["listingData.price", "propertyOverviewData.propertyInfo.price.amount"])
-                if price_raw in (None, "", "-"):
-                    price_raw = pick_first(dd, ["listingData.priceValue"])  # sometimes numeric
-                if price_raw in (None, "", "-"):
-                    price_raw = pick_first(dd, ["listingData.pricePretty", "listingData.price"])  # pretty text fallback
-                
-                row["price"] = parse_money_value(price_raw)
-
-                row["rooms"] = pick_first(dd, ROOMS_PATHS) or ""
-                row["toilets"] = pick_first(dd, TOILETS_PATHS) or ""
-                psf_raw = pick_first(dd, PSF_PATHS)
-                row["price_per_square_feet"] = digits_only(psf_raw) if psf_raw != "" else ""
-
-                row["furnishing"], furn_src = extract_furnishing(dd)
-                row["build_up"] = digits_only(pick_first(dd, FLOOR_AREA_PATHS))
-                row["land_area"]  = digits_only(pick_first(dd, LAND_AREA_PATHS))
-                row["tenure"] = map_tenure(pick_first(dd, TENURE_PATHS))
-                row["property_title"] = pick_first(dd, PROPERTY_TITLE_PATHS) or ""
-                row["bumi_lot"] = pick_first(dd, BUMI_PATHS) or ""
-                row["total_units"] = pick_first(dd, TOTAL_UNITS_PATHS) or ""
-                row["completion_year"] = pick_first(dd, COMPLETION_YEAR_PATHS) or ""
-                row["developer"] = pick_first(dd, DEVELOPER_PATHS) or ""
-
-                # Fill blanks from modal-style details
-                seed = {
-                    "property_title": row["property_title"], "bumi_lot": row["bumi_lot"],
-                    "developer": row["developer"], "completion_year": digits_only(row["completion_year"]),
-                    "build_up": row["build_up"], "land_area": row["land_area"],
-                    "price_per_square_feet": row["price_per_square_feet"], "tenure": row["tenure"],
-                    "furnishing": row.get("furnishing", "")
-                }
-                seed = fill_from_details(iter_detail_strings(dd), seed)
-                row["furnishing"] = seed["furnishing"] or row["furnishing"]
-                row["property_title"] = seed["property_title"] or row["property_title"]
-                row["bumi_lot"] = seed["bumi_lot"] or row["bumi_lot"]
-                row["developer"] = seed["developer"] or row["developer"]
-                row["completion_year"] = seed["completion_year"] or digits_only(row["completion_year"])
-                row["build_up"] = seed["build_up"] or row["build_up"]
-                row["land_area"]  = seed["land_area"] or row["land_area"]
-                row["price_per_square_feet"] = seed["price_per_square_feet"] or row["price_per_square_feet"]
-                row["tenure"] = seed["tenure"] or row["tenure"]
-                
-                row["amenities"]  = build_amenities(property_info)
-                row["facilities"] = build_facilities(dd)
-
-                row["scrape_unix"] = int(time.time())
+                row = build_adview_row(
+                    dd,
+                    raw_filename=raw_name,
+                    url_fallback=url,
+                    ad_id_hint=ad_id,
+                    intent=intent,
+                    segment=segment,
+                )
+                if not row.get("ad_id") and ad_id:
+                    row["ad_id"] = ad_id
 
                 if not hasattr(stage, "adview_rows"):
                     stage.adview_rows = []; stage.adview_rows_lock = threading.Lock()
@@ -1480,24 +2003,78 @@ if __name__ == "__main__":
     if hasattr(adview, "adview_rows") and adview.adview_rows:
         df_view = pd.DataFrame(adview.adview_rows).drop_duplicates(subset=["url"])
 
-        # Adlist slice for merge
-        df_adlist = pd.read_csv(adlist_csv_path)[["url","updated_date","listed_time","scrape_date","agent_id","ad_id"]]
-
-        # Merge on URL, prefer ADVIEW ad_id if present, else fill from ADLIST
-        df_merged = df_view.merge(df_adlist, on="url", how="left", suffixes=("", "_adlist"))
-        df_merged["ad_id"] = df_merged["ad_id"].fillna(df_merged.get("ad_id_adlist"))
-        if "ad_id_adlist" in df_merged.columns: df_merged.drop(columns=["ad_id_adlist"], inplace=True)
-
-        # To MYT for scrape_unix if you ever want; but final timing comes from ADLIST
-        final_cols = [
-            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
-            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
-            "tenure","property_title","bumi_lot","total_units","completion_year","developer",
-            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
-            "amenities","facilities",
-            # from ADLIST:
-            "updated_date","listed_time","scrape_date","agent_id"
+        # Adlist slice for merge (retain intent/segment/timing info)
+        df_adlist = pd.read_csv(adlist_csv_path)
+        adlist_keep = [
+            "url", "updated_date", "listed_time", "scrape_date", "agent_id", "ad_id", "intent", "segment"
         ]
+        adlist_present = [col for col in adlist_keep if col in df_adlist.columns]
+        df_adlist = df_adlist[adlist_present]
+        rename_map = {col: f"{col}_adlist" for col in adlist_present if col != "url"}
+        df_adlist = df_adlist.rename(columns=rename_map)
+
+        # Merge on URL
+        df_merged = df_view.merge(df_adlist, on="url", how="left")
+
+        if "ad_id_adlist" in df_merged.columns:
+            if "ad_id" not in df_merged.columns:
+                df_merged["ad_id"] = ""
+            df_merged["ad_id"] = df_merged["ad_id"].fillna("")
+            df_merged["ad_id"] = df_merged["ad_id"].where(
+                df_merged["ad_id"].astype(str).str.strip().ne(""),
+                df_merged["ad_id_adlist"],
+            )
+            df_merged.drop(columns=["ad_id_adlist"], inplace=True)
+
+        for col in ("intent", "segment", "updated_date"):
+            alt = f"{col}_adlist"
+            if alt in df_merged.columns:
+                if col not in df_merged.columns:
+                    df_merged[col] = ""
+                df_merged[col] = df_merged[col].where(df_merged[col].astype(str).str.strip().ne(""), df_merged[alt])
+                df_merged.drop(columns=[alt], inplace=True)
+
+        if "listed_time_adlist" in df_merged.columns:
+            if "listed_time" not in df_merged.columns:
+                df_merged["listed_time"] = ""
+            df_merged["listed_time"] = df_merged["listed_time"].where(
+                df_merged["listed_time"].astype(str).str.strip().ne(""),
+                df_merged["listed_time_adlist"],
+            )
+            df_merged.drop(columns=["listed_time_adlist"], inplace=True)
+
+        if "scrape_date_adlist" in df_merged.columns:
+            df_merged["adlist_scrape_date"] = df_merged["scrape_date_adlist"]
+            if "scrape_date" not in df_merged.columns:
+                df_merged["scrape_date"] = ""
+            mask = df_merged["scrape_date"].astype(str).str.strip().isin(["", "nan"])
+            df_merged.loc[mask, "scrape_date"] = df_merged.loc[mask, "adlist_scrape_date"]
+            df_merged.drop(columns=["scrape_date_adlist"], inplace=True)
+
+        if "agent_id_adlist" in df_merged.columns:
+            if "agent_id" not in df_merged.columns:
+                df_merged["agent_id"] = ""
+            df_merged["agent_id"] = df_merged["agent_id"].where(
+                df_merged["agent_id"].astype(str).str.strip().ne(""),
+                df_merged["agent_id_adlist"],
+            )
+            df_merged.drop(columns=["agent_id_adlist"], inplace=True)
+
+        primary_fieldnames = [
+            "activate_date", "ad_id", "agency", "build_up", "car_park", "created_time", "currency", "email",
+            "furnishing", "id", "land_area", "lister", "listing_id", "location", "market", "phone",
+            "phone_number", "phone_number2", "posted_date", "posted_time", "price", "property_type", "region",
+            "ren", "rent_sale", "rooms", "scrape_date", "seller_name", "source", "state", "subregion",
+            "title", "toilets", "type", "url", "updated_date"
+        ]
+        extra_fieldnames = [
+            "file", "address", "subarea", "lister_url", "agency_registration_number", "price_per_square_feet",
+            "furnishing_source", "tenure", "property_title", "bumi_lot", "total_units", "completion_year",
+            "developer", "amenities", "facilities", "scrape_unix", "intent", "segment"
+        ]
+        final_append = ["listed_time", "adlist_scrape_date", "agent_id"]
+
+        final_cols = primary_fieldnames + extra_fieldnames + final_append
         for c in final_cols:
             if c not in df_merged.columns:
                 df_merged[c] = ""
@@ -1505,13 +2082,21 @@ if __name__ == "__main__":
         df_final.to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
         total_rows_view = len(df_final)
     else:
-        pd.DataFrame(columns=[
-            "url","ad_id","title","property_type","state","subregion","subarea","location","address",
-            "price","price_per_square_feet","rooms","toilets","furnishing","build_up","land_area",
-            "tenure","property_title","bumi_lot","total_units","completion_year","developer",
-            "lister","lister_url","phone_number","agency","agency_registration_number","ren",
-            "amenities","facilities","updated_date","listed_time","scrape_date","agent_id"
-        ]).to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
+        primary_fieldnames = [
+            "activate_date", "ad_id", "agency", "build_up", "car_park", "created_time", "currency", "email",
+            "furnishing", "id", "land_area", "lister", "listing_id", "location", "market", "phone",
+            "phone_number", "phone_number2", "posted_date", "posted_time", "price", "property_type", "region",
+            "ren", "rent_sale", "rooms", "scrape_date", "seller_name", "source", "state", "subregion",
+            "title", "toilets", "type", "url", "updated_date"
+        ]
+        extra_fieldnames = [
+            "file", "address", "subarea", "lister_url", "agency_registration_number", "price_per_square_feet",
+            "furnishing_source", "tenure", "property_title", "bumi_lot", "total_units", "completion_year",
+            "developer", "amenities", "facilities", "scrape_unix", "intent", "segment", "listed_time",
+            "adlist_scrape_date", "agent_id"
+        ]
+        empty_cols = primary_fieldnames + extra_fieldnames
+        pd.DataFrame(columns=empty_cols).to_csv(adview_csv_path, index=False, encoding="utf-8-sig")
 
     print(f"📄 ADVIEW CSV written: {adview_csv_path} (rows: {total_rows_view})")
     
